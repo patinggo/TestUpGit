@@ -1,0 +1,1061 @@
+﻿#region "Import Order : SAPConnector"
+
+        public ActionResult ImportToSAP(int orderId)//ImportToSAP_SAPConnector
+        {
+
+            var order = _orderService.GetOrderById(orderId);
+           
+            //ตรวจสอบ Tax ก่อนส่งค่า กรณี One-time 
+            string cusIdStart = order.Customer.CustomerNumber.Trim().Substring(0, 1);
+            if (cusIdStart == "7")
+            {
+                if (order.Customer.TaxNo == null)
+                {
+                    ErrorNotification(_localizationService.GetResource("The order can't create SO Document. Because customer doesn't have Tax ID."));
+                    return RedirectToAction("Edit", "Order", new { id = orderId });
+                }
+            }
+
+            DataSet dsData = PrepareDataSODoc(order);
+            
+            GZSAPService ws = new GZSAPService();
+            DataSet dsResult = ws.CreateSODoc(dsData);
+
+
+            /*Reading Result*/
+            var returnValue = new List<OrderLogImportSAP>();
+            DataTable dtSOException = dsResult.Tables["dtSOException"];
+            DataTable dtRETURN = dsResult.Tables["dtSOReturn"];
+            DataTable dtSODoc = dsResult.Tables["dtSODoc"];
+
+            //----Return----//
+            string ResultString; string orderNoteString;
+
+            var ExceptionMsg = dtSOException.Rows[0]["Message"].ToString().Trim();
+            if (ExceptionMsg == "Y")
+            {
+                var E_SALES_DOC = dtSODoc.Rows[0]["E_SALES_DOC"].ToString();
+                var E_ADVANCE_REC_DOC = dtSODoc.Rows[0]["E_ADVANCE_REC_DOC"].ToString();
+                var E_COMP_CODE = dtSODoc.Rows[0]["E_COMP_CODE"].ToString();
+                var E_FISCAL_YEAR = dtSODoc.Rows[0]["E_FISCAL_YEAR"].ToString();
+
+
+                foreach (DataRow row in dtRETURN.Rows)
+                {
+                    returnValue.Add(new OrderLogImportSAP()
+                    {
+                        Type = row["Type"].ToString(),
+                        IdNo = row["Id"].ToString(),
+                        Number = row["Number"].ToString(),
+                        Message = row["Message"].ToString(),
+                        LogNo = row["Log_No"].ToString(),
+                        LogMsgNo = row["Log_Msg_No"].ToString(),
+                        MessageV1 = row["Message_V1"].ToString(),
+                        MessageV2 = row["Message_V2"].ToString(),
+                        MessageV3 = row["Message_V3"].ToString(),
+                        MessageV4 = row["Message_V4"].ToString(),
+                        Parameter = row["Parameter"].ToString(),
+                        Row = row["Row"].ToString(),
+                        Field = row["Field"].ToString(),
+                        SYSTEM = row["SYSTEM"].ToString()
+                    });
+                }
+
+                string messageAlert = "";
+                string messageType = "";//S:Success, E:Error
+                string GeneratedDocNumber = "";
+                var LogIdValue = 0;
+                try
+                { LogIdValue = _orderService.GetOrderLogById(orderId).LogId; }
+                catch
+                { LogIdValue = 0; }
+                int LogId;
+                if (LogIdValue == null) { LogId = 1; } else { LogId = LogIdValue + 1; }
+
+                //save Log to OrderLogImportSAP
+                foreach (var item in returnValue)
+                {
+                    //Insert OrderLogSAP
+                    item.LogId = LogId;
+                    item.OrderId = orderId;
+                    item.RecordDate = DateTime.UtcNow;
+                    //เก็บ Log Result
+                    _orderService.InsertOrderLogImportSAP(item);
+
+                    //message alert
+                    if (item.Type == "W")
+                    { messageAlert = (messageAlert == "") ? "" + item.Message : messageAlert + ";" + item.Message; messageType = "E"; GeneratedDocNumber = ""; }
+                    else if (item.Type == "E")
+                    { messageAlert = (messageAlert == "") ? "" + item.Message : messageAlert + ";" + item.Message; messageType = "E"; GeneratedDocNumber = ""; }
+                }
+
+                //Check Result
+                if (order.PaymentStatus.ToString() == PaymentStatus.Paid.ToString())
+                //ตรวจสอบทั้ง SO Doc และ FI Doc >> DocType == "Z212"[with Adv. Recieve >> ชำระเงินผ่าน bill Payment, Paysabuy, จ่ายหมด]
+                {
+                    if (E_SALES_DOC.Trim() == "" || E_ADVANCE_REC_DOC.Trim() == "")
+                    {
+                        ResultString = "Error";
+                        orderNoteString = @"""Order Post SO"" Export Status has been changed to " + ResultString + "[" + messageAlert + "]";
+                    }
+                    else
+                    {
+                        ResultString = "Success";
+                        orderNoteString = @"""Order Post SO"" Export Status has been changed to " + ResultString + " [Number of Generated Document :" + E_SALES_DOC + ", Number of FI Document :" + E_ADVANCE_REC_DOC + "]";
+                    }
+                }
+                else //ตรวจสอบเฉพาะ SO Doc >> DocType = "Z211"[ชำระเงินสด(เก็บเงินปลายทาง),เครดิต 30 วัน]
+                {
+                    if (E_SALES_DOC.Trim() == "")
+                    {
+                        ResultString = "Error";
+                        orderNoteString = @"""Order Post SO"" Export Status has been changed to " + ResultString + "[" + messageAlert + "]";
+                    }
+                    else
+                    {
+                        ResultString = "Success";
+                        orderNoteString = @"""Order Post SO"" Export Status has been changed to " + ResultString + " [Number of Generated Document :" + E_SALES_DOC + " ]";
+                    }
+                }
+
+                //Update ExportStatusId
+                order.ExportStatus = ResultString;
+
+                order.OrderNotes.Add(new OrderNote
+                {
+                    Note = orderNoteString,
+                    OrderId = orderId,
+                    CreatedOnUtc = DateTime.UtcNow
+                });
+                //Update table:Order
+                _orderService.UpdateOrder(order);
+
+                if (ResultString == "Error")
+                {
+                    ErrorNotification(_localizationService.GetResource("order post so export status has been changed to error"));
+
+                    string[] errStrings = messageAlert.Split(';');
+                    foreach (string s in errStrings)
+                    {
+                        ErrorNotification(_localizationService.GetResource(s));
+                    }
+                    ErrorNotification(_localizationService.GetResource("Please check your data then click Create SO Document again."));
+                }
+                else
+                { SuccessNotification(_localizationService.GetResource(orderNoteString)); }
+
+                //Save Log
+                _customerActivityService.InsertActivity("PostOrderToSAP", _localizationService.GetResource("activityLog.PostOrderToSAP"), order.Id);
+            }
+            else
+            {
+                ResultString = "Exception Error";
+                orderNoteString = @"""Order Post SO"" Export Status has been changed to " + ResultString + "[" + ExceptionMsg + "]";
+
+                order.OrderNotes.Add(new OrderNote
+                {
+                    Note = orderNoteString,
+                    OrderId = orderId,
+                    CreatedOnUtc = DateTime.UtcNow
+                });
+
+                ErrorNotification(_localizationService.GetResource("order post so export status has been changed to error"));
+                ErrorNotification(_localizationService.GetResource("Exception error : " + ExceptionMsg));
+            }
+
+            return RedirectToAction("Edit", "Order", new { id = orderId });
+
+
+        }
+        protected DataSet PrepareDataSODoc(Order order)
+        {
+            CreateDTSODoc();
+            //DataTable dtShipTo = new DataTable("dtShipTo");
+            //DataTable dtSoldTo = new DataTable("dtSoldTo");
+            //DataTable dtHdFi = new DataTable("dtHdFi");
+            //DataTable dtHdSo = new DataTable("dtHdSo");
+            //DataTable dtHdSoPartner = new DataTable("dtHdSoPartner");
+            //DataTable dtItSo = new DataTable("dtItSo");
+
+
+            //------------------prepare Data------------------
+            //check One-time 
+            string cusIdStart = order.Customer.CustomerNumber.Trim().Substring(0, 1);
+
+            string PartnerSoldToId = "";// "100315";
+            string PartnerShipToId = "";// "100315";
+            string TransZone = "";
+            if (cusIdStart == "7") //one-time >> OT03, OT53  
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    PartnerSoldToId = "OT03";
+                    PartnerShipToId = "OT03";
+                }
+                else//Corperate
+                {
+                    PartnerSoldToId = "OT53";
+                    PartnerShipToId = "OT53";
+                }
+                TransZone = "Z100000028";//Fix เป็นเขตสาธร
+            }
+            else
+            {
+                PartnerSoldToId = order.Customer.CustomerNumber;
+                PartnerShipToId = order.Customer.CustomerNumber;
+                TransZone = "";
+            }
+
+            TimeZoneInfo CurrenttimeZone = TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time");
+            DateTime PoDatS;
+            PoDatS = ConvertToUserTime(order.CreatedOnUtc, DateTimeKind.Local, CurrenttimeZone);
+            DateTime BLDatS;
+            BLDatS = ConvertToUserTime(DateTime.UtcNow, DateTimeKind.Local, CurrenttimeZone);
+
+            string DocType = "";
+            if (order.PaymentStatus.ToString() == PaymentStatus.Paid.ToString())
+            {
+                DocType = "Z212";//with Adv. Recieve >> ชำระเงินผ่าน bill Payment, Paysabuy, จ่ายหมด
+            }
+            else
+            {
+                DocType = "Z211";//ชำระเงินสด(เก็บเงินปลายทาง),เครดิต 30 วัน
+            }
+
+            //ReqDateH = DateNow + 3 >> ReqDateH is not Holiday and Saturday and Sunday
+            DateTime ReqDateH;
+            ReqDateH = ConvertToUserTime(DateTime.Today.AddDays(3), DateTimeKind.Local, CurrenttimeZone);
+            //>> Holiday
+            while (CheckHoliday(ReqDateH) == true || ReqDateH.DayOfWeek.ToString().ToUpper() == "SATURDAY" || ReqDateH.DayOfWeek.ToString().ToUpper() == "SUNDAY")
+            {
+                ReqDateH = ConvertToUserTime(ReqDateH.AddDays(1), DateTimeKind.Local, CurrenttimeZone);
+            }
+
+
+            //------------------prepare Data------------------
+
+            //City ใน NopCommerch คือ DISTRICT ใน SAP
+            //StateProvince.Name ใน NopCommerch คือ CITY ใน SAP
+
+            //1)Zisd0001HdSoShipTo >> dtShipTo
+            DataRow drShipTo = dtShipTo.NewRow();
+            if (cusIdStart != "7")//PartnerShipToId == "100315"
+            {
+                drShipTo["NAME"] = "";
+                drShipTo["NAME_2"] = "";
+                drShipTo["NAME_3"] = "";
+                drShipTo["NAME_4"] = "";
+                drShipTo["STREET_LNG"] = "";
+                drShipTo["STR_SUPPL1"] = "";
+                drShipTo["DISTRICT"] = "";
+                drShipTo["CITY"] = "";
+                drShipTo["POSTL_COD1"] = "";
+                drShipTo["COUNTRY"] = "";
+                drShipTo["TEL1_NUMBR"] = "";
+                drShipTo["TEL1_EXT"] = "";
+                drShipTo["FAX_NUMBER"] = "";
+                drShipTo["FAX_EXTENS"] = "";
+                drShipTo["E_MAIL"] = "";
+                drShipTo["CONTACT_PERSON"] = "";
+                drShipTo["TRANSPZONE"] = "";
+            }
+            else
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    drShipTo["NAME"] = order.ShippingAddress.FirstName;
+                    drShipTo["NAME_2"] = " " + order.ShippingAddress.LastName.ToString();
+                }
+                else//Corperate
+                {
+                    if (order.ShippingAddress.Company == null)
+                    {
+                        drShipTo["NAME"] = order.ShippingAddress.FirstName;
+                        drShipTo["NAME_2"] = " " + order.ShippingAddress.LastName.ToString();
+                    }
+                    else if (order.ShippingAddress.Company.Length > 35)
+                    {
+                        string resultStr = SetString(order.ShippingAddress.Company);
+                        string[] resultSplit = resultStr.Split(';');
+
+                        drShipTo["NAME"] = resultSplit[0];
+                        drShipTo["NAME_2"] = resultSplit[1];
+                    }
+                    else
+                    {
+                        drShipTo["NAME"] = order.ShippingAddress.Company;
+                        drShipTo["NAME_2"] = "";
+                    }
+                }
+                drShipTo["NAME_3"] = "";
+                drShipTo["NAME_4"] = "";
+                drShipTo["STREET_LNG"] = order.ShippingAddress.Address1 == null ? "" : order.ShippingAddress.Address1; //order.ShippingAddress.Address1.ToString();
+                drShipTo["STR_SUPPL1"] = order.ShippingAddress.Address2 == null ? "" : order.ShippingAddress.Address2; //order.ShippingAddress.Address2.ToString();
+                drShipTo["DISTRICT"] = order.ShippingAddress.City == null ? "" : order.ShippingAddress.City;
+                if (order.ShippingAddress.StateProvince == null)
+                { drShipTo["CITY"] = ""; }
+                else
+                {
+                    drShipTo["CITY"] = order.ShippingAddress.StateProvince.Name == null ? "" : order.ShippingAddress.StateProvince.Name; //order.ShippingAddress.City.ToString();
+                }
+                drShipTo["POSTL_COD1"] = order.ShippingAddress.ZipPostalCode == null ? "" : order.ShippingAddress.ZipPostalCode; //order.ShippingAddress.ZipPostalCode.ToString();
+                drShipTo["COUNTRY"] = "TH";
+                drShipTo["TEL1_NUMBR"] = order.ShippingAddress.PhoneNumber == null ? "" : order.ShippingAddress.PhoneNumber; //order.ShippingAddress.PhoneNumber.ToString();
+                drShipTo["TEL1_EXT"] = "";
+                drShipTo["FAX_NUMBER"] = order.ShippingAddress.FaxNumber == null ? "" : order.ShippingAddress.FaxNumber; //order.ShippingAddress.FaxNumber.ToString();
+                drShipTo["FAX_EXTENS"] = "";
+                drShipTo["E_MAIL"] = order.ShippingAddress.Email == null ? "" : order.ShippingAddress.Email; //order.ShippingAddress.Email.ToString();
+                drShipTo["CONTACT_PERSON"] = order.ShippingAddress.FirstName + " " + order.ShippingAddress.LastName;
+                drShipTo["TRANSPZONE"] = TransZone;
+            }
+            dtShipTo.Rows.Add(drShipTo);
+
+
+
+            //2)Zisd0001HdSoSoldTo >> dtSoldTo
+            DataRow drSoldTo = dtSoldTo.NewRow();
+            if (cusIdStart != "7")//PartnerSoldToId == "100315"
+            {
+                drSoldTo["NAME"] = "";
+                drSoldTo["NAME_2"] = "";
+                drSoldTo["NAME_3"] = "";
+                drSoldTo["NAME_4"] = "";
+                drSoldTo["STREET_LNG"] = "";
+                drSoldTo["STR_SUPPL1"] = "";
+                drSoldTo["DISTRICT"] = "";
+                drSoldTo["CITY"] = "";
+                drSoldTo["POSTL_COD1"] = "";
+                drSoldTo["COUNTRY"] = "";
+                drSoldTo["TEL1_NUMBR"] = "";
+                drSoldTo["TEL1_EXT"] = "";
+                drSoldTo["FAX_NUMBER"] = "";
+                drSoldTo["FAX_EXTENS"] = "";
+                drSoldTo["E_MAIL"] = "";
+                drSoldTo["CONTACT_PERSON"] = "";
+                drSoldTo["TAX_ID"] = "";
+                drSoldTo["BRANCH_NO"] = "";
+            }
+            else
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    drSoldTo["NAME"] = order.BillingAddress.FirstName;
+                    drSoldTo["NAME_2"] = " " + order.BillingAddress.LastName;
+                }
+                else//Corperate
+                {
+                    if (order.BillingAddress.Company == null)
+                    {
+                        drSoldTo["NAME"] = order.BillingAddress.FirstName;
+                        drSoldTo["NAME_2"] = " " + order.BillingAddress.LastName;
+                    }
+                    else if (order.BillingAddress.Company.Length > 35)
+                    {
+                        string resultStr = SetString(order.BillingAddress.Company);
+                        string[] resultSplit = resultStr.Split(';');
+
+                        drSoldTo["NAME"] = resultSplit[0];
+                        drSoldTo["NAME_2"] = resultSplit[1];
+                    }
+                    else
+                    {
+                        drSoldTo["NAME"] = order.BillingAddress.Company;
+                        drSoldTo["NAME_2"] = "";
+                    }
+                }
+                drSoldTo["NAME_3"] = "";
+                drSoldTo["NAME_4"] = "";
+                drSoldTo["STREET_LNG"] = order.BillingAddress.Address1 == null ? "" : order.BillingAddress.Address1;
+                drSoldTo["STR_SUPPL1"] = order.BillingAddress.Address2 == null ? "" : order.BillingAddress.Address2;
+                drSoldTo["DISTRICT"] = order.BillingAddress.City == null ? "" : order.BillingAddress.City;
+                if (order.BillingAddress.StateProvince == null)
+                { drSoldTo["CITY"] = ""; }
+                else
+                {
+                    drSoldTo["CITY"] = order.BillingAddress.StateProvince.Name == null ? "" : order.BillingAddress.StateProvince.Name; //order.BillingAddress.City.ToString();
+                }
+                drSoldTo["POSTL_COD1"] = order.BillingAddress.ZipPostalCode == null ? "" : order.BillingAddress.ZipPostalCode;
+                drSoldTo["COUNTRY"] = "TH";
+                drSoldTo["TEL1_NUMBR"] = order.BillingAddress.PhoneNumber == null ? "" : order.BillingAddress.PhoneNumber;
+                drSoldTo["TEL1_EXT"] = "";
+                drSoldTo["FAX_NUMBER"] = order.BillingAddress.FaxNumber == null ? "" : order.BillingAddress.FaxNumber;
+                drSoldTo["FAX_EXTENS"] = "";
+                drSoldTo["E_MAIL"] = order.BillingAddress.Email == null ? "" : order.BillingAddress.Email;
+                drSoldTo["CONTACT_PERSON"] = order.BillingAddress.FirstName + " " + order.BillingAddress.LastName;
+                drSoldTo["TAX_ID"] = order.Customer.TaxNo;
+                var BranchNo = "";
+                if (order.Customer.CustomerTypeId == 2)
+                {
+                    BranchNo = String.Format("{0:00000}", (order.BillingAddress.BranchNumber == null ? "0" : order.BillingAddress.BranchNumber));
+                }
+                else
+                {
+                    BranchNo = "00000";
+                }
+                drSoldTo["BRANCH_NO"] = BranchNo;
+            }
+            dtSoldTo.Rows.Add(drSoldTo);
+
+
+            //3)Zisd0001HdFi(ส่วนมัดจำ) >> dtHdFi
+            var shippingInclTax = Convert.ToDecimal(order.OrderShippingExclTax);
+            var shippingExclTax = decimal.Divide(shippingInclTax, Convert.ToDecimal(1.07));
+            var TotalExckTax = order.OrderTotal - order.OrderTax;
+
+            DataRow drHdFi = dtHdFi.NewRow();
+            if (order.PaymentStatus.ToString() == PaymentStatus.Paid.ToString())
+            {
+                drHdFi["BLDAT"] = BLDatS.ToString("yyyyMMdd");
+                drHdFi["NEWKO"] = "1119010";
+
+                var FWBAS = ((TotalExckTax - shippingInclTax) + shippingExclTax);
+                drHdFi["FWBAS"] = String.Format("{0:0.00}", FWBAS);
+                //(order.OrderSubtotalExclTax - order.OrderSubTotalDiscountExclTax).ToString() >> ผิดเนื่องจาก ค่าขนส่งเป็นค่าที่รวม Vat แล้ว ต้องหาค่าขนส่งที่ไม่รวม Vat มา
+
+                var WRBTR = (order.OrderTax + (shippingInclTax - shippingExclTax));
+                drHdFi["WRBTR"] = String.Format("{0:0.00}", WRBTR);
+                //order.OrderTax.ToString(); >> ผิดเนื่องจาก ค่าขนส่งเป็นค่าที่รวม Vat แล้ว ต้องหาค่า Vat ค่าขนส่งมา
+            }
+            else
+            {
+                drHdFi["BLDAT"] = "";
+                drHdFi["NEWKO"] = "";
+                drHdFi["FWBAS"] = 0;
+                drHdFi["WRBTR"] = 0;
+            }
+            dtHdFi.Rows.Add(drHdFi);
+
+
+            //4)Zisd0001HdSo >> dtHdSo
+            DataRow drHdSo = dtHdSo.NewRow();
+            string PurchNoS = "GZ_" + order.Id.ToString();
+            drHdSo["HD_INDICATOR"] = "01";
+            drHdSo["PURCH_NO_S"] = PurchNoS;//Web_PO_2001
+            drHdSo["PO_DAT_S"] = PoDatS.ToString("yyyyMMdd");//20130926
+            drHdSo["DOC_TYPE"] = DocType;
+            drHdSo["SALES_ORG"] = "103";
+            drHdSo["DISTR_CHAN"] = "20";
+            drHdSo["DIVISION"] = "50";
+            drHdSo["REQ_DATE_H"] = ReqDateH.ToString("yyyyMMdd");//20130926
+            drHdSo["PURCH_NO_C"] = "."; //ไม่ส่งค่า >> ให้ใส่เป็น จุด ไปแทน
+            drHdSo["PLANT"] = "1035";
+            drHdSo["SHIP_COND"] = "";// "01";
+            drHdSo["CURRENCY"] = "THB";
+            dtHdSo.Rows.Add(drHdSo);
+
+
+            //5)Zisd0001HdSoPartner >> dtHdSoPartner
+            DataRow drHdSoPartner = dtHdSoPartner.NewRow();
+            drHdSoPartner["SOLD_TO_ID"] = PartnerSoldToId;
+            drHdSoPartner["SHIP_TO_ID"] = PartnerShipToId;
+            drHdSoPartner["EMPLOYEE_ID"] = _workContext.CurrentCustomer.CustomerNumber; //"1001";
+            dtHdSoPartner.Rows.Add(drHdSoPartner);
+
+
+            //6)Zisd0001ItSo >> dtItSo
+            DataRow drItSo;
+            int PoitmNoItem = 10;
+
+            //--สินค้าที่สั่งซื้อ [ManufacturerPartNumber ขึ้นต้นด้วย 1]
+            //--สินค้าที่ขายเป็น Pack [ManufacturerPartNumber ขึ้นต้นด้วย 3]
+            //--สินค้าแถม [ITM_TYPE_USAGE=FREE] price = 0
+            foreach (OrderItem value in order.OrderItems)
+            {
+                decimal CondValue = value.UnitPriceExclTax;//if (CondValue < Convert.ToDecimal(1047.06)) { CondValue = Convert.ToDecimal(1470.59); }
+                //FREE Item
+                string ITM_TYPE_USAGE = "";
+                if (CondValue > 0) { ITM_TYPE_USAGE = ""; } else { ITM_TYPE_USAGE = "FREE"; }
+                string Material = value.Product.ManufacturerPartNumber;
+                if (value.Product.ManufacturerPartNumber == null) { Material = "1000000021"; }
+
+                drItSo = dtItSo.NewRow();
+                drItSo["IT_INDICATOR"] = "11";
+                drItSo["POITM_NO_S"] = PoitmNoItem;
+                drItSo["MATERIAL"] = Material;
+                drItSo["ITM_TYPE_USAGE"] = ITM_TYPE_USAGE;
+                drItSo["COND_VALUE"] = CondValue;
+                drItSo["REQ_QTY"] = Convert.ToDecimal(value.Quantity);
+                dtItSo.Rows.Add(drItSo);
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //--Promotion ส่วนลดท้ายบิล [ReqQty=1]
+            if (order.OrderSubTotalDiscountExclTax > 0)
+            {
+                decimal PromotionConValue = -(Math.Abs(order.OrderSubTotalDiscountExclTax));
+
+                //กรณีเป็น Line ให้ส่ง Material เป็น 3000000002
+                var MATERIAL = "3000000001";                       
+
+                drItSo = dtItSo.NewRow();
+                drItSo["IT_INDICATOR"] = "11";
+                drItSo["POITM_NO_S"] = PoitmNoItem;
+                drItSo["MATERIAL"] = MATERIAL;//"3000000001";//Fix 3000000001 - 3000000010
+                drItSo["ITM_TYPE_USAGE"] = "";
+                drItSo["COND_VALUE"] = PromotionConValue;
+                drItSo["REQ_QTY"] = "1";
+                dtItSo.Rows.Add(drItSo);
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //Voucher Box
+            if (order.VoucherCode != null)
+            {
+                //กรณีเป็น Line ให้ส่ง Material เป็น 3000000002
+                var MATERIAL = "3000000002";
+
+                drItSo = dtItSo.NewRow();
+                drItSo["IT_INDICATOR"] = "11";
+                drItSo["POITM_NO_S"] = PoitmNoItem;
+                drItSo["MATERIAL"] = MATERIAL;//"3000000001";//Fix 3000000001 - 3000000010
+                drItSo["ITM_TYPE_USAGE"] = "";
+                drItSo["COND_VALUE"] = 0.01;
+                drItSo["REQ_QTY"] = "1";
+                dtItSo.Rows.Add(drItSo);
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //--ค่าขนส่ง [ReqQty=1]
+            if (order.OrderShippingExclTax > 0)
+            {
+                drItSo = dtItSo.NewRow();
+                drItSo["IT_INDICATOR"] = "11";
+                drItSo["POITM_NO_S"] = PoitmNoItem;
+                drItSo["MATERIAL"] = "3000000011"; //Fix ค่าขนส่ง:3000000011, ค่าติดตั้ง:3000000012, ค่าขนส่งและติดตั้ง:3000000013
+                drItSo["ITM_TYPE_USAGE"] = "";
+                drItSo["COND_VALUE"] = String.Format("{0:0.00}", shippingExclTax);//เอามาจากข้อ 3)//Convert.ToDecimal(order.OrderShippingExclTax)
+                drItSo["REQ_QTY"] = "1";
+                dtItSo.Rows.Add(drItSo);
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //Create DataSet
+            DataSet dsResult = new DataSet("dsResult");
+            dsResult.Tables.Add(dtShipTo);
+            dsResult.Tables.Add(dtSoldTo);
+            dsResult.Tables.Add(dtHdFi);
+            dsResult.Tables.Add(dtHdSo);
+            dsResult.Tables.Add(dtHdSoPartner);
+            dsResult.Tables.Add(dtItSo);
+
+            return dsResult;
+        }
+        protected void CreateDTSODoc()
+        {
+            //1)Zisd0001HdSoShipTo
+            //DataTable dtShipTo = new DataTable("dtShipTo");
+            dtShipTo.Clear();
+            dtShipTo.Columns.Add("NAME");
+            dtShipTo.Columns.Add("NAME_2");
+            dtShipTo.Columns.Add("NAME_3");
+            dtShipTo.Columns.Add("NAME_4");
+            dtShipTo.Columns.Add("STREET_LNG");
+            dtShipTo.Columns.Add("STR_SUPPL1");
+            dtShipTo.Columns.Add("DISTRICT");
+            dtShipTo.Columns.Add("CITY");
+            dtShipTo.Columns.Add("POSTL_COD1");
+            dtShipTo.Columns.Add("COUNTRY");
+            dtShipTo.Columns.Add("TEL1_NUMBR");
+            dtShipTo.Columns.Add("TEL1_EXT");
+            dtShipTo.Columns.Add("FAX_NUMBER");
+            dtShipTo.Columns.Add("FAX_EXTENS");
+            dtShipTo.Columns.Add("E_MAIL");
+            dtShipTo.Columns.Add("CONTACT_PERSON");
+            dtShipTo.Columns.Add("TRANSPZONE");
+
+            //2)Zisd0001HdSoSoldTo
+            //DataTable dtSoldTo = new DataTable("dtSoldTo");
+            dtSoldTo.Clear();
+            dtSoldTo.Columns.Add("NAME");
+            dtSoldTo.Columns.Add("NAME_2");
+            dtSoldTo.Columns.Add("NAME_3");
+            dtSoldTo.Columns.Add("NAME_4");
+            dtSoldTo.Columns.Add("STREET_LNG");
+            dtSoldTo.Columns.Add("STR_SUPPL1");
+            dtSoldTo.Columns.Add("DISTRICT");
+            dtSoldTo.Columns.Add("CITY");
+            dtSoldTo.Columns.Add("POSTL_COD1");
+            dtSoldTo.Columns.Add("COUNTRY");
+            dtSoldTo.Columns.Add("TEL1_NUMBR");
+            dtSoldTo.Columns.Add("TEL1_EXT");
+            dtSoldTo.Columns.Add("FAX_NUMBER");
+            dtSoldTo.Columns.Add("FAX_EXTENS");
+            dtSoldTo.Columns.Add("E_MAIL");
+            dtSoldTo.Columns.Add("CONTACT_PERSON");
+            dtSoldTo.Columns.Add("TAX_ID");
+            dtSoldTo.Columns.Add("BRANCH_NO");
+
+            //3)Zisd0001HdFi >>> ส่วนมัดจำ
+            //DataTable dtHdFi = new DataTable("dtHdFi");
+            dtHdFi.Clear();
+            dtHdFi.Columns.Add("BLDAT");
+            dtHdFi.Columns.Add("NEWKO");
+            dtHdFi.Columns.Add("FWBAS");
+            dtHdFi.Columns.Add("WRBTR");
+
+            //4)Zisd0001HdSo
+            //DataTable dtHdSo = new DataTable("dtHdSo");
+            dtHdSo.Clear();
+            dtHdSo.Columns.Add("HD_INDICATOR");
+            dtHdSo.Columns.Add("PURCH_NO_S");
+            dtHdSo.Columns.Add("PO_DAT_S");
+            dtHdSo.Columns.Add("DOC_TYPE");
+            dtHdSo.Columns.Add("SALES_ORG");
+            dtHdSo.Columns.Add("DISTR_CHAN");
+            dtHdSo.Columns.Add("DIVISION");
+            dtHdSo.Columns.Add("REQ_DATE_H");
+            dtHdSo.Columns.Add("PURCH_NO_C");
+            dtHdSo.Columns.Add("PLANT");
+            dtHdSo.Columns.Add("SHIP_COND");
+            dtHdSo.Columns.Add("CURRENCY");
+
+            //5)Zisd0001HdSoPartner
+            //DataTable dtHdSoPartner = new DataTable("dtHdSoPartner");
+            dtHdSoPartner.Clear();
+            dtHdSoPartner.Columns.Add("SOLD_TO_ID");
+            dtHdSoPartner.Columns.Add("SHIP_TO_ID");
+            dtHdSoPartner.Columns.Add("EMPLOYEE_ID");
+
+            //6)Zisd0001ItSo
+            //DataTable dtItSo = new DataTable("dtItSo");
+            dtItSo.Clear();
+            dtItSo.Columns.Add("IT_INDICATOR");
+            dtItSo.Columns.Add("POITM_NO_S");
+            dtItSo.Columns.Add("MATERIAL");
+            dtItSo.Columns.Add("ITM_TYPE_USAGE");
+            dtItSo.Columns.Add("COND_VALUE");
+            dtItSo.Columns.Add("REQ_QTY");
+        }
+
+        protected bool CheckHoliday(DateTime vDateTime)
+        {
+            var HolidayFlag = true;
+
+            var CountHoliday = _categoryService.GetCountHolidayByDate(vDateTime);
+            if (CountHoliday > 0) { HolidayFlag = true; } else { HolidayFlag = false; }
+
+            return HolidayFlag;
+        }
+        protected String GetDataExportSAP(int orderId)
+        {
+            var order = _orderService.GetOrderById(orderId);
+
+            string DataSAP = "";
+
+
+            //------------------prepare Data------------------
+            //check One-time 
+            //string cusIdStart = order.Customer.CustomerNumber.Trim().Substring(0, 1);
+            string cusIdStart = "1";
+
+            string PartnerSoldToId = "";// "100315";
+            string PartnerShipToId = "";// "100315";
+            string TransZone = "";
+            if (cusIdStart == "7") //one-time >> OT03, OT53  
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    PartnerSoldToId = "OT03";
+                    PartnerShipToId = "OT03";
+                }
+                else//Corperate
+                {
+                    PartnerSoldToId = "OT53";
+                    PartnerShipToId = "OT53";
+                }
+                TransZone = "Z100000028";//Fix เป็นเขตสาธร
+            }
+            else
+            {
+                PartnerSoldToId = order.Customer.CustomerNumber;
+                PartnerShipToId = order.Customer.CustomerNumber;
+                TransZone = "";
+            }
+
+            TimeZoneInfo CurrenttimeZone = TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time");
+            DateTime PoDatS;
+            PoDatS = ConvertToUserTime(order.CreatedOnUtc, DateTimeKind.Local, CurrenttimeZone);
+
+            string DocType = "";
+            if (order.PaymentStatus.ToString() == PaymentStatus.Paid.ToString())
+            {
+                DocType = "Z212";//with Adv. Recieve >> ชำระเงินผ่าน bill Payment, Paysabuy, จ่ายหมด
+            }
+            else
+            {
+                DocType = "Z211";//ชำระเงินสด(เก็บเงินปลายทาง),เครดิต 30 วัน
+            }
+
+            //ReqDateH = DateNow + 3 >> ReqDateH is not Holiday and Saturday and Sunday
+            DateTime ReqDateH;
+            ReqDateH = ConvertToUserTime(DateTime.Today.AddDays(3), DateTimeKind.Local, CurrenttimeZone);
+            //>> Holiday
+            while (CheckHoliday(ReqDateH) == true || ReqDateH.DayOfWeek.ToString().ToUpper() == "SATURDAY" || ReqDateH.DayOfWeek.ToString().ToUpper() == "SUNDAY")
+            {
+                ReqDateH = ConvertToUserTime(ReqDateH.AddDays(1), DateTimeKind.Local, CurrenttimeZone);
+            }
+
+            //------------------prepare Data------------------
+
+            //City ใน NopCommerch คือ DISTRICT ใน SAP
+            //StateProvince.Name ใน NopCommerch คือ CITY ใน SAP
+
+            //1)Zisd0001HdSoShipTo >> dtShipTo
+            DataSAP = DataSAP + ", Zisd0001HdSoShipTo >> ";
+            if (cusIdStart != "7")//PartnerShipToId == "100315"
+            {
+                DataSAP = DataSAP + ", NAME = " + "";
+                DataSAP = DataSAP + ", NAME_2 = " + "";
+                DataSAP = DataSAP + ", NAME_3 = " + "";
+                DataSAP = DataSAP + ", NAME_4 = " + "";
+                DataSAP = DataSAP + ", STREET_LNG = " + "";
+                DataSAP = DataSAP + ", STR_SUPPL1 = " + "";
+                DataSAP = DataSAP + ", DISTRICT = " + "";
+                DataSAP = DataSAP + ", CITY = " + "";
+                DataSAP = DataSAP + ", POSTL_COD1 = " + "";
+                DataSAP = DataSAP + ", COUNTRY = " + "";
+                DataSAP = DataSAP + ", TEL1_NUMBR = " + "";
+                DataSAP = DataSAP + ", TEL1_EXT = " + "";
+                DataSAP = DataSAP + ", FAX_NUMBER = " + "";
+                DataSAP = DataSAP + ", FAX_EXTENS = " + "";
+                DataSAP = DataSAP + ", E_MAIL = " + "";
+                DataSAP = DataSAP + ", CONTACT_PERSON = " + "";
+                DataSAP = DataSAP + ", TRANSPZONE = " + "";
+            }
+            else
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    DataSAP = DataSAP + ",NAME= " + order.ShippingAddress.FirstName;
+                    DataSAP = DataSAP + ",NAME_2= " + " " + order.ShippingAddress.LastName;
+                }
+                else//Corperate
+                {
+                    if (order.ShippingAddress.Company == null)
+                    {
+                        DataSAP = DataSAP + ",NAME= " + order.ShippingAddress.FirstName;
+                        DataSAP = DataSAP + ",NAME_2= " + " " + order.ShippingAddress.LastName;
+                    }
+                    else if (order.ShippingAddress.Company.Length > 35)
+                    {
+                        string resultStr = SetString(order.ShippingAddress.Company);
+                        string[] resultSplit = resultStr.Split(';');
+
+                        DataSAP = DataSAP + ",NAME= " + resultSplit[0];
+                        DataSAP = DataSAP + ",NAME_2= " + resultSplit[1].ToString();
+                    }
+                    else
+                    {
+                        DataSAP = DataSAP + ",NAME= " + order.ShippingAddress.Company;
+                        DataSAP = DataSAP + ",NAME_2= " + "";
+                    }
+                }
+                //DataSAP = DataSAP + ",NAME= " + order.ShippingAddress.FirstName;
+                //DataSAP = DataSAP + ",NAME_2= " + order.ShippingAddress.LastName;
+                //DataSAP = DataSAP + ",NAME_3= " + (order.ShippingAddress.Company == null ? "" : order.ShippingAddress.Company);
+                DataSAP = DataSAP + ",NAME_3= " + "";
+                DataSAP = DataSAP + ",NAME_4= " + "";
+                DataSAP = DataSAP + ",STREET_LNG= " + (order.ShippingAddress.Address1 == null ? "" : order.ShippingAddress.Address1); //order.ShippingAddress.Address1.ToString();
+                DataSAP = DataSAP + ",STR_SUPPL1= " + (order.ShippingAddress.Address2 == null ? "" : order.ShippingAddress.Address2); //order.ShippingAddress.Address2.ToString();
+                DataSAP = DataSAP + ",DISTRICT= " + (order.ShippingAddress.City == null ? "" : order.ShippingAddress.City);
+                if (order.ShippingAddress.StateProvince == null)
+                { DataSAP = DataSAP + ",CITY= "; }
+                else
+                {
+                    DataSAP = DataSAP + ",CITY= " + (order.ShippingAddress.StateProvince.Name == null ? "" : order.ShippingAddress.StateProvince.Name);//order.ShippingAddress.City.ToString();
+                }
+                DataSAP = DataSAP + ",POSTL_COD1= " + (order.ShippingAddress.ZipPostalCode == null ? "" : order.ShippingAddress.ZipPostalCode); //order.ShippingAddress.ZipPostalCode.ToString();
+                DataSAP = DataSAP + ",COUNTRY= " + "TH";
+                DataSAP = DataSAP + ",TEL1_NUMBR= " + (order.ShippingAddress.PhoneNumber == null ? "" : order.ShippingAddress.PhoneNumber); //order.ShippingAddress.PhoneNumber.ToString();
+                DataSAP = DataSAP + ",TEL1_EXT= " + "";
+                DataSAP = DataSAP + ",FAX_NUMBER= " + (order.ShippingAddress.FaxNumber == null ? "" : order.ShippingAddress.FaxNumber); //order.ShippingAddress.FaxNumber.ToString();
+                DataSAP = DataSAP + ",FAX_EXTENS= " + "";
+                DataSAP = DataSAP + ",E_MAIL= " + (order.ShippingAddress.Email == null ? "" : order.ShippingAddress.Email); //order.ShippingAddress.Email.ToString();
+                DataSAP = DataSAP + ",CONTACT_PERSON= " + (order.ShippingAddress.FirstName + " " + order.ShippingAddress.LastName);
+                DataSAP = DataSAP + ",TRANSPZONE= " + TransZone;
+            }
+
+
+
+
+            //2)Zisd0001HdSoSoldTo >> dtSoldTo
+            DataSAP = DataSAP + ", Zisd0001HdSoSoldTo >> ";
+            if (cusIdStart != "7")//PartnerSoldToId == "100315"
+            {
+                DataSAP = DataSAP + ",NAME= " + "";
+                DataSAP = DataSAP + ",NAME_2= " + "";
+                DataSAP = DataSAP + ",NAME_3= " + "";
+                DataSAP = DataSAP + ",NAME_4= " + "";
+                DataSAP = DataSAP + ",STREET_LNG= " + "";
+                DataSAP = DataSAP + ",STR_SUPPL1= " + "";
+                DataSAP = DataSAP + ",DISTRICT= " + "";
+                DataSAP = DataSAP + ",CITY= " + "";
+                DataSAP = DataSAP + ",POSTL_COD1= " + "";
+                DataSAP = DataSAP + ",COUNTRY= " + "";
+                DataSAP = DataSAP + ",TEL1_NUMBR= " + "";
+                DataSAP = DataSAP + ",TEL1_EXT= " + "";
+                DataSAP = DataSAP + ",FAX_NUMBER= " + "";
+                DataSAP = DataSAP + ",FAX_EXTENS= " + "";
+                DataSAP = DataSAP + ",E_MAIL= " + "";
+                DataSAP = DataSAP + ",CONTACT_PERSON= " + "";
+                DataSAP = DataSAP + ",TAX_ID= " + "";
+                DataSAP = DataSAP + ",BRANCH_NO= " + "";
+            }
+            else
+            {
+                if (order.Customer.CustomerTypeId == 1)//Personal
+                {
+                    DataSAP = DataSAP + ",NAME= " + order.BillingAddress.FirstName;
+                    DataSAP = DataSAP + ",NAME_2= " + " " + order.BillingAddress.LastName;
+                }
+                else//Corperate
+                {
+                    if (order.BillingAddress.Company == null)
+                    {
+                        DataSAP = DataSAP + ",NAME= " + order.BillingAddress.FirstName;
+                        DataSAP = DataSAP + ",NAME_2= " + " " + order.BillingAddress.LastName;
+                    }
+                    else if (order.BillingAddress.Company.Length > 35)
+                    {
+                        string resultStr = SetString(order.BillingAddress.Company);
+                        string[] resultSplit = resultStr.Split(';');
+
+                        DataSAP = DataSAP + ",NAME= " + resultSplit[0];
+                        DataSAP = DataSAP + ",NAME_2= " + resultSplit[1].ToString();
+                    }
+                    else
+                    {
+                        DataSAP = DataSAP + ",NAME= " + order.BillingAddress.Company;
+                        DataSAP = DataSAP + ",NAME_2= " + "";
+                    }
+                }
+                //DataSAP = DataSAP + ",NAME= " + order.BillingAddress.FirstName;
+                //DataSAP = DataSAP + ",NAME_2= " + order.BillingAddress.LastName;
+                //DataSAP = DataSAP + ",NAME_3= " + (order.BillingAddress.Company == null ? "" : order.BillingAddress.Company);
+                DataSAP = DataSAP + ",NAME_3= " + "";
+                DataSAP = DataSAP + ",NAME_4= " + "";
+                DataSAP = DataSAP + ",STREET_LNG= " + (order.BillingAddress.Address1 == null ? "" : order.BillingAddress.Address1);
+                DataSAP = DataSAP + ",STR_SUPPL1= " + (order.BillingAddress.Address2 == null ? "" : order.BillingAddress.Address2);
+                DataSAP = DataSAP + ",DISTRICT= " + (order.BillingAddress.City == null ? "" : order.BillingAddress.City);
+                if (order.BillingAddress.StateProvince == null)
+                { DataSAP = DataSAP + ",CITY= "; }
+                else
+                {
+                    DataSAP = DataSAP + ",CITY= " + (order.BillingAddress.StateProvince.Name == null ? "" : order.BillingAddress.StateProvince.Name);//order.BillingAddress.City.ToString();
+                }
+                DataSAP = DataSAP + ",POSTL_COD1= " + (order.BillingAddress.ZipPostalCode == null ? "" : order.BillingAddress.ZipPostalCode);
+                DataSAP = DataSAP + ",COUNTRY= " + "TH";
+                DataSAP = DataSAP + ",TEL1_NUMBR= " + (order.BillingAddress.PhoneNumber == null ? "" : order.BillingAddress.PhoneNumber);
+                DataSAP = DataSAP + ",TEL1_EXT= " + "";
+                DataSAP = DataSAP + ",FAX_NUMBER= " + (order.BillingAddress.FaxNumber == null ? "" : order.BillingAddress.FaxNumber);
+                DataSAP = DataSAP + ",FAX_EXTENS= " + "";
+                DataSAP = DataSAP + ",E_MAIL= " + (order.BillingAddress.Email == null ? "" : order.BillingAddress.Email);
+                DataSAP = DataSAP + ",CONTACT_PERSON= " + order.BillingAddress.FirstName + " " + order.BillingAddress.LastName;
+                DataSAP = DataSAP + ",TAX_ID= " + order.Customer.TaxNo;
+                var BranchNo = "";
+                if (order.Customer.CustomerTypeId == 2)
+                {
+                    BranchNo = String.Format("{0:00000}", Convert.ToInt64(order.BillingAddress.BranchNumber == null ? "0" : order.BillingAddress.BranchNumber.Trim()));
+                }
+                else
+                {
+                    BranchNo = "00000";
+                }
+                DataSAP = DataSAP + ",BRANCH_NO= " + BranchNo;
+            }
+
+
+
+            //3)Zisd0001HdFi(ส่วนมัดจำ) >> dtHdFi
+            var shippingInclTax = Convert.ToDecimal(order.OrderShippingExclTax);
+            var shippingExclTax = decimal.Divide(shippingInclTax, Convert.ToDecimal(1.07));
+            var TotalExckTax = order.OrderTotal - order.OrderTax;
+
+            DataSAP = DataSAP + ", Zisd0001HdFi >> ";
+            if (order.PaymentStatus.ToString() == PaymentStatus.Paid.ToString())
+            {
+                DataSAP = DataSAP + ",BLDAT = " + PoDatS.ToString("yyyyMMdd");
+                DataSAP = DataSAP + ",NEWKO = 1119010";
+
+                var FWBAS = ((TotalExckTax - shippingInclTax) + shippingExclTax);
+                DataSAP = DataSAP + ",FWBAS = " + String.Format("{0:0.00}", FWBAS);
+                //(order.OrderTotal - order.OrderTax).ToString(); >> ผิดเนื่องจาก ค่าขนส่งเป็นค่าที่รวม Vat แล้ว
+                //(order.OrderSubtotalExclTax - order.OrderSubTotalDiscountExclTax).ToString();
+
+                var WRBTR = (order.OrderTax + (shippingInclTax - shippingExclTax));
+                DataSAP = DataSAP + ",WRBTR = " + String.Format("{0:0.00}", WRBTR);
+                //order.OrderTax.ToString(); ผิดเนื่องจาก ค่าขนส่งเป็นค่าที่รวม Vat แล้ว
+            }
+            else
+            {
+                DataSAP = DataSAP + ",BLDAT = " + "";
+                DataSAP = DataSAP + ",NEWKO = " + "";
+                DataSAP = DataSAP + ",FWBAS = 0";
+                DataSAP = DataSAP + ",WRBTR = 0";
+            }
+
+
+            //4)Zisd0001HdSo >> dtHdSo
+            DataSAP = DataSAP + ", Zisd0001HdSo >> ";
+            string PurchNoS = order.Id.ToString();
+            DataSAP = DataSAP + ",HD_INDICATOR = 01";
+            DataSAP = DataSAP + ",PURCH_NO_S = " + PurchNoS;//Web_PO_2001
+            DataSAP = DataSAP + ",PO_DAT_S = " + PoDatS.ToString("yyyyMMdd");//20130926
+            DataSAP = DataSAP + ",DOC_TYPE = " + DocType;
+            DataSAP = DataSAP + ",SALES_ORG = 103";
+            DataSAP = DataSAP + ",DISTR_CHAN = 20";
+            DataSAP = DataSAP + ",DIVISION = 50";
+            DataSAP = DataSAP + ",REQ_DATE_H = " + ReqDateH.ToString("yyyyMMdd");//20130926
+            DataSAP = DataSAP + ",PURCH_NO_C = ."; //ไม่ส่งค่า >> ให้ใส่เป็น จุด ไปแทน
+            DataSAP = DataSAP + ",PLANT = 1035";
+            DataSAP = DataSAP + ",SHIP_COND = " + "";// "01";
+            DataSAP = DataSAP + ",CURRENCY = THB";
+
+
+            //5)Zisd0001HdSoPartner >> dtHdSoPartner
+            DataSAP = DataSAP + ", Zisd0001HdSoPartner >> ";
+            DataSAP = DataSAP + ",SOLD_TO_ID = " + PartnerSoldToId;
+            DataSAP = DataSAP + ",SHIP_TO_ID = " + PartnerShipToId;
+            DataSAP = DataSAP + ",EMPLOYEE_ID = " + _workContext.CurrentCustomer.CustomerNumber; //"1001";
+
+
+            //6)Zisd0001ItSo >> dtItSo
+            DataSAP = DataSAP + ", Zisd0001ItSo >> ";
+            int PoitmNoItem = 10;
+
+            //--สินค้าที่สั่งซื้อ [ManufacturerPartNumber ขึ้นต้นด้วย 1]
+            //--สินค้าที่ขายเป็น Pack [ManufacturerPartNumber ขึ้นต้นด้วย 3]
+            //--สินค้าแถม [ITM_TYPE_USAGE=FREE] price = 0
+            foreach (OrderItem value in order.OrderItems)
+            {
+                decimal CondValue = value.UnitPriceExclTax;//if (CondValue < Convert.ToDecimal(1047.06)) { CondValue = Convert.ToDecimal(1470.59); }
+                //FREE Item
+                string ITM_TYPE_USAGE = "";
+                if (CondValue > 0) { ITM_TYPE_USAGE = ""; } else { ITM_TYPE_USAGE = "FREE"; }
+                string Material = value.Product.ManufacturerPartNumber;
+                if (value.Product.ManufacturerPartNumber == null) { Material = "1000000021"; }
+
+
+                DataSAP = DataSAP + ",IT_INDICATOR = 11";
+                DataSAP = DataSAP + ",POITM_NO_S = " + PoitmNoItem;
+                DataSAP = DataSAP + ",MATERIAL = " + Material;
+                DataSAP = DataSAP + ",ITM_TYPE_USAGE = " + ITM_TYPE_USAGE;
+                DataSAP = DataSAP + ",COND_VALUE = " + CondValue;
+                DataSAP = DataSAP + ",REQ_QTY = " + Convert.ToDecimal(value.Quantity);
+
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //--Promotion ส่วนลดท้ายบิล [ReqQty=1]
+            if (order.OrderSubTotalDiscountExclTax > 0)
+            {
+                decimal PromotionConValue = -(Math.Abs(order.OrderSubTotalDiscountExclTax));
+
+                DataSAP = DataSAP + ",IT_INDICATOR = 11";
+                DataSAP = DataSAP + ",POITM_NO_S = " + PoitmNoItem;
+                DataSAP = DataSAP + ",MATERIAL = 3000000001";//Fix 3000000001 - 3000000010
+                DataSAP = DataSAP + ",ITM_TYPE_USAGE = " + "";
+                DataSAP = DataSAP + ",COND_VALUE = " + PromotionConValue;
+                DataSAP = DataSAP + ",REQ_QTY = 1";
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+
+            //Voucher Box
+            if (order.VoucherCode != null)
+            {
+                //กรณีเป็น Line ให้ส่ง Material เป็น 3000000002
+                var MATERIAL = "3000000002";
+
+                DataSAP = DataSAP + ",IT_INDICATOR = 11";
+                DataSAP = DataSAP + ",POITM_NO_S = " + PoitmNoItem;
+                DataSAP = DataSAP + ",MATERIAL = 3000000001";//"3000000001";//Fix 3000000001 - 3000000010
+                DataSAP = DataSAP + ",ITM_TYPE_USAGE = " + "";
+                DataSAP = DataSAP + ",COND_VALUE = 0.01";
+                DataSAP = DataSAP + ",REQ_QTY = 1";
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+            //--ค่าขนส่ง [ReqQty=1]
+            if (order.OrderShippingExclTax > 0)
+            {
+
+                DataSAP = DataSAP + ",IT_INDICATOR = 11";
+                DataSAP = DataSAP + ",POITM_NO_S = " + PoitmNoItem;
+                DataSAP = DataSAP + ",MATERIA = 3000000011"; //Fix ค่าขนส่ง:3000000011, ค่าติดตั้ง:3000000012, ค่าขนส่งและติดตั้ง:3000000013
+                DataSAP = DataSAP + ",ITM_TYPE_USAGE = " + "";
+                DataSAP = DataSAP + ",COND_VALUE = " + String.Format("{0:0.00}", shippingExclTax);//เอามาจากข้อ 3)
+                DataSAP = DataSAP + ",REQ_QTY = 1";
+
+                PoitmNoItem = PoitmNoItem + 10;
+            }
+
+
+            return DataSAP;
+
+        }
+        protected String SetString(string vString)
+        {
+            //string checkStringMaster = "ะ,า,ั,็,ิ,ี,ึ,ื,ุ,ู,ำ,่,้,๊,๋,์";
+            string resultA = ""; string resultB = "";
+
+
+            string checkStringA = "ั,็,ื,่,้,๊,๋";
+            string checkStringB = "ะ,า,ั,็,ิ,ี,ึ,ื,ุ,ู,ำ,่,้,๊,๋,์";
+
+
+            byte[] encodedBytes = System.Text.Encoding.UTF8.GetBytes(vString.Trim());
+            string utf8_String = System.Text.Encoding.UTF8.GetString(encodedBytes);
+
+
+            if (utf8_String.Length > 35)
+            {
+                int lenStringA = 35;
+                int i = 1;
+
+                //ส่วนหน้า
+                while (i < lenStringA)
+                {
+                    if (checkStringA.IndexOf(utf8_String.Substring(0, lenStringA).Substring(lenStringA - 1, 1)) == -1)
+                    {
+                        //ส่วนหลัง
+                        if (checkStringB.IndexOf(utf8_String.Substring(lenStringA).Substring(0, 1)) == -1)
+                        {
+                            //ผ่าน
+                            resultA = utf8_String.Substring(0, lenStringA); resultB = utf8_String.Substring(lenStringA);
+                            break;
+                        }
+                        else
+                        {
+                            lenStringA = lenStringA - 1;
+                            i++;
+                        }
+                    }
+                    else
+                    {
+                        lenStringA = lenStringA - 1;
+                        i++;
+                    }
+                }
+
+            }
+            else
+            { resultA = utf8_String; resultB = ""; }
+
+            return resultA + ";" + resultB;
+
+        }
+
+        public DateTime ConvertToUserTime(DateTime dt, DateTimeKind sourceDateTimeKind, TimeZoneInfo timezone)
+        {
+            dt = DateTime.SpecifyKind(dt, sourceDateTimeKind);
+            var currentUserTimeZoneInfo = timezone;
+            return TimeZoneInfo.ConvertTime(dt, currentUserTimeZoneInfo);
+        }
+        #endregion
